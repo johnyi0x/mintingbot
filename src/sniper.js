@@ -1,6 +1,5 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
-import { Agent, fetch as undiciFetch } from "node:undici";
 import {
   Contract,
   Interface,
@@ -45,18 +44,6 @@ const mintData = mintIface.encodeFunctionData("mintPublic", [
   QUANTITY,
 ]);
 
-const sequencerAgent = new Agent({
-  keepAliveTimeout: 60_000,
-  keepAliveMaxTimeout: 60_000,
-  connections: 8,
-  pipelining: 1,
-});
-const backupAgent = new Agent({
-  keepAliveTimeout: 60_000,
-  keepAliveMaxTimeout: 60_000,
-  connections: 8,
-  pipelining: 1,
-});
 let live = false;
 
 function env(name) {
@@ -208,12 +195,11 @@ function pendingGunners() {
   return gunners.filter((g) => !g.success);
 }
 
-async function postRpc(url, body, agent = backupAgent) {
-  const res = await undiciFetch(url, {
+async function postRpc(url, body) {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
-    dispatcher: agent,
   });
   return res.json();
 }
@@ -229,20 +215,17 @@ async function syncClock() {
 
 async function warmSequencer() {
   try {
-    await postRpc(sequencerUrl, chainIdBody, sequencerAgent);
+    await postRpc(sequencerUrl, chainIdBody);
   } catch {
     /* keep-alive only */
   }
 }
 
 async function warmSenders() {
-  await Promise.allSettled([
-    postRpc(sequencerUrl, chainIdBody, sequencerAgent),
-    ...backupUrls.map((url) => postRpc(url, chainIdBody, backupAgent)),
-  ]);
+  await Promise.allSettled(sendUrls.map((url) => postRpc(url, chainIdBody)));
 }
 
-async function sendRaw(url, raw, agent) {
+async function sendRaw(url, raw) {
   const json = await postRpc(
     url,
     JSON.stringify({
@@ -251,7 +234,6 @@ async function sendRaw(url, raw, agent) {
       method: "eth_sendRawTransaction",
       params: [raw],
     }),
-    agent,
   );
   if (json.error) {
     const err = new Error(json.error.message || "rpc error");
@@ -269,7 +251,7 @@ function fanoutBackups(g, raw) {
   if (g.backupSent) return;
   g.backupSent = true;
   for (const url of backupUrls) {
-    void sendRaw(url, raw, backupAgent).then(
+    void sendRaw(url, raw).then(
       (hash) => {
         if (hash) g.lastHash = hash;
         log(g.tag, rpcLabel(url), hash);
@@ -286,7 +268,7 @@ function fanoutBackups(g, raw) {
 async function broadcast(g) {
   const raw = g.signedRaw;
   try {
-    const hash = await sendRaw(sequencerUrl, raw, sequencerAgent);
+    const hash = await sendRaw(sequencerUrl, raw);
     g.lastHash = hash;
     g.queued = true;
     log(g.tag, "sequencer", hash);
@@ -302,7 +284,7 @@ async function broadcast(g) {
     }
     log(g.tag, "sequencer error", msg);
     const results = await Promise.allSettled(
-      backupUrls.map((url) => sendRaw(url, raw, backupAgent).then((hash) => ({ url, hash }))),
+      backupUrls.map((url) => sendRaw(url, raw).then((hash) => ({ url, hash }))),
     );
     for (const r of results) {
       if (r.status === "fulfilled") {
@@ -705,8 +687,6 @@ await waitLoop();
 
 if (ws) await ws.destroy();
 for (const { p } of providers) p.destroy();
-void sequencerAgent.close();
-void backupAgent.close();
 
 for (const g of gunners) {
   log(g.tag, g.success ? "OK minted" : "did not mint");
