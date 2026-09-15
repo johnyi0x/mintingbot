@@ -45,7 +45,6 @@ const SEQ_FETCH_MS = 1_500;
 /** During GO: short abort so a hung RPC frees the slot and the next wave can shoot. */
 const GO_SEQ_MS = 450;
 const GO_BACKUP_MS = 700;
-const MAX_INFLIGHT_SEQ = 2;
 const MAX_INFLIGHT_BACKUP = 1;
 const HOT_ARM_MS = 8_000;
 
@@ -276,20 +275,22 @@ function isQueued(msg) {
   return /already known|known transaction|nonce too low/i.test(msg || "");
 }
 
-/** Fire-and-forget with in-flight caps. Never await. Never pile up hung RPCs (that froze CCA). */
+/** Always POST sequencer every wave (void). Never await. Never skip a shot because RPC is slow. */
 function shootRaw(g, raw) {
   const targets = [sequencerUrl, ...backupUrls];
   for (let i = 0; i < targets.length; i++) {
     const url = targets[i];
     const isSeq = i === 0;
-    // Backups every 3rd wave only — sequencer is the hot path; saves CU + sockets.
+    // Backups every 3rd wave — sequencer fires EVERY wave.
     if (!isSeq && (g.waveCount % 3) !== 0) continue;
 
-    const inflight = g.inflight.get(url) || 0;
-    const cap = isSeq ? MAX_INFLIGHT_SEQ : MAX_INFLIGHT_BACKUP;
-    if (inflight >= cap) continue;
+    // Only throttle backups. Sequencer never skips — max send rate until close.
+    if (!isSeq) {
+      const inflight = g.inflight.get(url) || 0;
+      if (inflight >= MAX_INFLIGHT_BACKUP) continue;
+      g.inflight.set(url, inflight + 1);
+    }
 
-    g.inflight.set(url, inflight + 1);
     const timeoutMs = goMode
       ? isSeq
         ? GO_SEQ_MS
@@ -337,7 +338,9 @@ function shootRaw(g, raw) {
         },
       )
       .finally(() => {
-        g.inflight.set(url, Math.max(0, (g.inflight.get(url) || 1) - 1));
+        if (!isSeq) {
+          g.inflight.set(url, Math.max(0, (g.inflight.get(url) || 1) - 1));
+        }
       });
   }
   g.waveCount = (g.waveCount || 0) + 1;
@@ -493,7 +496,7 @@ function startFireEngine(reason) {
   if (fireTimer) return;
   goMode = true;
   live = true;
-  log("FIRE ENGINE ON —", reason, "— shoot every", String(LIVE_RETRY_MS) + "ms, no await, inflight-capped");
+  log("FIRE ENGINE ON —", reason, "— sequencer POST every", String(LIVE_RETRY_MS) + "ms until mint/soldout/close, never await");
   fireWave(reason);
   fireTimer = setInterval(() => {
     if (soldOut || allMinted() || nowMs() > endMs + 12_000) {
