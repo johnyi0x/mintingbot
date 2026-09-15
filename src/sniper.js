@@ -38,7 +38,7 @@ const LIVE_RETRY_MS = 8;
 const GO_WINDOW_MS = 250;
 const ARM_MS = 60 * 60 * 1000;
 const HOT_MS = 120_000;
-const IDLE_CHECK_MS = 10 * 60 * 1000;
+const IDLE_CHECK_MS = 60_000;
 const mintIface = new Interface(SEADROP_ABI);
 const mintData = mintIface.encodeFunctionData("mintPublic", [
   NFT,
@@ -121,16 +121,12 @@ function intervalFor(msUntil) {
 }
 
 function feesFor(balance) {
-  const cap = 1_700_000_000_000_000n;
-  const dust = 50_000_000_000_000n;
-  const leftover = balance > dust ? balance - dust : (balance * 90n) / 100n;
-  const spend = leftover < cap ? leftover : cap;
-  let maxFee = spend / GAS_LIMIT;
-  if (maxFee < 4n * GWEI) maxFee = 4n * GWEI;
-  if (maxFee * GAS_LIMIT > leftover && leftover > 0n) maxFee = leftover / GAS_LIMIT;
-  if (maxFee > 100n * GWEI) maxFee = 100n * GWEI;
-  let prio = (maxFee * 80n) / 100n;
-  if (prio < 3n * GWEI) prio = 3n * GWEI;
+  const dust = 80_000_000_000_000n;
+  const spendable = balance > dust ? balance - dust : (balance * 85n) / 100n;
+  let maxFee = spendable / (GAS_LIMIT * 2n);
+  if (maxFee < 1n) maxFee = 1n;
+  let prio = (maxFee * 75n) / 100n;
+  if (prio < 1n) prio = 1n;
   if (prio > maxFee) prio = maxFee;
   return { maxFee, prio };
 }
@@ -290,6 +286,11 @@ async function broadcast(g) {
       return g.lastHash;
     }
     log(g.tag, "sequencer error", msg);
+    if (/exceeds max supply|MintQuantityExceedsMaxSupply/i.test(msg)) {
+      soldOut = true;
+      log("sold out — stopping sends");
+      return g.lastHash;
+    }
     const results = await Promise.allSettled(
       backupUrls.map((url) => sendRaw(url, raw).then((hash) => ({ url, hash }))),
     );
@@ -326,6 +327,13 @@ async function signAtNonce(g, nonce) {
   });
 }
 
+async function refreshFees(g) {
+  const balance = await primary.getBalance(g.address);
+  const { maxFee, prio } = feesFor(balance);
+  g.maxFee = maxFee;
+  g.prio = prio;
+}
+
 async function signGunner(g) {
   g.queued = false;
   g.backupSent = false;
@@ -346,6 +354,7 @@ async function signGunner(g) {
 }
 
 async function promoteBackup(g, why) {
+  if (soldOut || g.success) return;
   log(g.tag, why);
   g.queued = false;
   g.backupSent = false;
@@ -428,6 +437,7 @@ function fireWave(reason) {
 }
 
 async function checkSoldOut() {
+  if (soldOut) return;
   try {
     const minted = await nft.totalMinted();
     if (minted >= maxSupply) {
@@ -437,6 +447,32 @@ async function checkSoldOut() {
   } catch (err) {
     log("supply check", err.shortMessage || err.message);
   }
+}
+
+async function parkForever(why) {
+  log(why);
+  log("PARK — no more sends, no more RPC. leftover ETH stays in the wallets. health server stays up so Render does not restart.");
+  if (ws) {
+    try {
+      await ws.destroy();
+    } catch {
+      /* already closed */
+    }
+    ws = null;
+  }
+  for (const { p } of providers) {
+    try {
+      p.destroy();
+    } catch {
+      /* already closed */
+    }
+  }
+  try {
+    publicProvider.destroy();
+  } catch {
+    /* already closed */
+  }
+  for (;;) await sleep(3_600_000);
 }
 
 async function simulate(dropStartMs) {
@@ -604,7 +640,7 @@ async function armAlchemyWs() {
 async function idleUntilArm() {
   if (startMs - nowMs() <= ARM_MS) return;
   log(
-    "IDLE — no Alchemy WS, no sequencer warm, no resign. Public RPC check every 10m until T-1h. Mint",
+    "IDLE — no Alchemy WS, no sequencer warm, no resign. Public RPC re-reads startTime every 60s until T-1h. Mint",
     cdt(Math.floor(startMs / 1000)),
     "CDT",
   );
@@ -641,7 +677,12 @@ async function idleUntilArm() {
 
 async function armReady() {
   log("READY T-1h — public RPC watch. Alchemy + sequencer warm start at T-2m.");
-  await Promise.all(gunners.map((g) => signGunner(g)));
+  await Promise.all(
+    gunners.map(async (g) => {
+      await refreshFees(g);
+      await signGunner(g);
+    }),
+  );
 }
 
 async function waitLoop() {
@@ -662,7 +703,10 @@ async function waitLoop() {
         await Promise.all([
           syncClock(),
           warmSenders(),
-          ...pendingGunners().map((g) => signGunner(g)),
+          ...pendingGunners().map(async (g) => {
+            await refreshFees(g);
+            await signGunner(g);
+          }),
         ]);
         lastResign = Date.now();
       } catch (err) {
@@ -756,8 +800,7 @@ bindRenderPort();
 await preflight();
 await idleUntilArm();
 if (soldOut) {
-  log("sold out before public");
-  process.exit(1);
+  await parkForever("sold out before public");
 }
 await armReady();
 log(
@@ -765,15 +808,13 @@ log(
 );
 await waitLoop();
 
-if (ws) await ws.destroy();
-for (const { p } of providers) p.destroy();
-publicProvider.destroy();
-
 for (const g of gunners) {
   log(g.tag, g.success ? "OK minted" : "did not mint");
 }
-if (!gunners.some((g) => g.success)) {
-  log("no wallet minted");
-  process.exit(1);
+if (soldOut) {
+  await parkForever("collection minted out");
 }
-log("done");
+if (allMinted()) {
+  await parkForever("all our wallets minted");
+}
+await parkForever("public window over — stopping so leftover ETH is not spent");
