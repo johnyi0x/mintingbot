@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
+import { Agent, fetch as undiciFetch } from "node:undici";
 import {
   Contract,
   Interface,
@@ -24,8 +25,18 @@ import {
 const QUANTITY = 1n;
 const GAS_LIMIT = 210000n;
 const GWEI = 1_000_000_000n;
-const KEY_NAMES = ["RF_GENESIS_KEY", "RF_GENESIS_KEY2", "RF_GENESIS_KEY3"];
+const KEY_NAMES = [
+  "RF_GENESIS_KEY",
+  "RF_GENESIS_KEY2",
+  "RF_GENESIS_KEY3",
+  "RF_GENESIS_KEY4",
+  "RF_GENESIS_KEY5",
+  "RF_GENESIS_KEY6",
+  "RF_GENESIS_KEY7",
+];
 const DRY_RUN = (process.env.RF_GENESIS_DRY_RUN || "").trim() === "1";
+const LIVE_RETRY_MS = 8;
+const GO_WINDOW_MS = 250;
 const mintIface = new Interface(SEADROP_ABI);
 const mintData = mintIface.encodeFunctionData("mintPublic", [
   NFT,
@@ -34,6 +45,20 @@ const mintData = mintIface.encodeFunctionData("mintPublic", [
   QUANTITY,
 ]);
 
+const sequencerAgent = new Agent({
+  keepAliveTimeout: 60_000,
+  keepAliveMaxTimeout: 60_000,
+  connections: 8,
+  pipelining: 1,
+});
+const backupAgent = new Agent({
+  keepAliveTimeout: 60_000,
+  keepAliveMaxTimeout: 60_000,
+  connections: 8,
+  pipelining: 1,
+});
+let live = false;
+
 function env(name) {
   return (process.env[name] || "").trim();
 }
@@ -41,6 +66,7 @@ function env(name) {
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(" ")}`;
   console.log(line);
+  if (live) return;
   mkdirSync("logs", { recursive: true });
   appendFileSync("logs/sniper.log", line + "\n");
 }
@@ -99,12 +125,11 @@ function sleep(ms) {
 function intervalFor(msUntil) {
   if (msUntil > 120_000) return 60_000;
   if (msUntil > 15_000) return 1_000;
-  if (msUntil > 2_000) return 50;
-  return 10;
+  if (msUntil > 2_000) return 40;
+  return LIVE_RETRY_MS;
 }
 
 function feesFor(balance) {
-  // Hard cap 0.0017 ETH. Lowest wallet is ~0.00177, leave a little dust so the tx can send.
   const cap = 1_700_000_000_000_000n;
   const dust = 50_000_000_000_000n;
   const leftover = balance > dust ? balance - dust : (balance * 90n) / 100n;
@@ -119,6 +144,11 @@ function feesFor(balance) {
   return { maxFee, prio };
 }
 
+function rpcLabel(url) {
+  if (/sequencer/i.test(url)) return "sequencer";
+  return url.split("/v2/")[0];
+}
+
 const keys = [];
 for (const name of KEY_NAMES) {
   const value = env(name);
@@ -131,20 +161,16 @@ if (!keys.length) {
   console.error(`
 Missing wallet keys.
 
-Set at least RF_GENESIS_KEY. Optional extras: RF_GENESIS_KEY2, RF_GENESIS_KEY3.
+Set RF_GENESIS_KEY plus optional RF_GENESIS_KEY2 … RF_GENESIS_KEY7.
 These are account private keys (0x hex), not Secret Recovery Phrases.
-
-This terminal:
-  $env:RF_GENESIS_KEY  = "0x..."
-  $env:RF_GENESIS_KEY2 = "0x..."
-  $env:RF_GENESIS_KEY3 = "0x..."
-  node src/sniper.js
 `);
   process.exit(1);
 }
 
 const urls = readUrls();
-const sendUrls = unique([...urls, SEQUENCER_RPC]);
+const sendUrls = unique([SEQUENCER_RPC, ...urls]);
+const sequencerUrl = sendUrls.find((u) => /sequencer/i.test(u)) || SEQUENCER_RPC;
+const backupUrls = sendUrls.filter((u) => u !== sequencerUrl);
 const providers = urls.map((url) => ({
   url,
   p: new JsonRpcProvider(url, 4663, { staticNetwork: true }),
@@ -162,9 +188,16 @@ let mintPrice = 0n;
 let soldOut = false;
 let clockOffsetMs = 0;
 const gunners = [];
+const chainIdBody = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "eth_chainId",
+  params: [],
+});
 
 function nowMs() {
-  return Date.now() + clockOffsetMs;
+  // Negative offset = last block is behind wall clock. Using it would fire early and revert.
+  return Date.now() + Math.max(0, clockOffsetMs);
 }
 
 function allMinted() {
@@ -173,6 +206,16 @@ function allMinted() {
 
 function pendingGunners() {
   return gunners.filter((g) => !g.success);
+}
+
+async function postRpc(url, body, agent = backupAgent) {
+  const res = await undiciFetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+    dispatcher: agent,
+  });
+  return res.json();
 }
 
 async function syncClock() {
@@ -184,30 +227,32 @@ async function syncClock() {
   log("clock vs chain", clockOffsetMs, "ms (positive = this PC is behind the chain)");
 }
 
-async function warmSenders() {
-  await Promise.allSettled(
-    sendUrls.map((url) =>
-      fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
-      }),
-    ),
-  );
+async function warmSequencer() {
+  try {
+    await postRpc(sequencerUrl, chainIdBody, sequencerAgent);
+  } catch {
+    /* keep-alive only */
+  }
 }
 
-async function sendRaw(url, raw) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
+async function warmSenders() {
+  await Promise.allSettled([
+    postRpc(sequencerUrl, chainIdBody, sequencerAgent),
+    ...backupUrls.map((url) => postRpc(url, chainIdBody, backupAgent)),
+  ]);
+}
+
+async function sendRaw(url, raw, agent) {
+  const json = await postRpc(
+    url,
+    JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
       method: "eth_sendRawTransaction",
       params: [raw],
     }),
-  });
-  const json = await res.json();
+    agent,
+  );
   if (json.error) {
     const err = new Error(json.error.message || "rpc error");
     err.code = json.error.code;
@@ -216,24 +261,66 @@ async function sendRaw(url, raw) {
   return json.result;
 }
 
+function isQueued(msg) {
+  return /already known|known transaction|nonce too low/i.test(msg || "");
+}
+
+function fanoutBackups(g, raw) {
+  if (g.backupSent) return;
+  g.backupSent = true;
+  for (const url of backupUrls) {
+    void sendRaw(url, raw, backupAgent).then(
+      (hash) => {
+        if (hash) g.lastHash = hash;
+        log(g.tag, rpcLabel(url), hash);
+      },
+      (err) => {
+        const msg = err.shortMessage || err.message || String(err);
+        if (isQueued(msg)) log(g.tag, rpcLabel(url), "already queued");
+        else log(g.tag, rpcLabel(url), "rpc error", msg);
+      },
+    );
+  }
+}
+
 async function broadcast(g) {
   const raw = g.signedRaw;
-  const results = await Promise.allSettled(sendUrls.map((url) => sendRaw(url, raw).then((hash) => ({ url, hash }))));
-  let hash = null;
-  for (const r of results) {
-    if (r.status === "fulfilled") {
-      log(g.tag, r.value.url.split("/v2/")[0], r.value.hash);
-      hash = r.value.hash;
-    } else {
-      const msg = r.reason?.shortMessage || r.reason?.message || String(r.reason);
-      if (/already known|known transaction|nonce too low/i.test(msg)) {
-        log(g.tag, "already queued");
-      } else {
-        log(g.tag, "rpc error", msg);
-      }
+  try {
+    const hash = await sendRaw(sequencerUrl, raw, sequencerAgent);
+    g.lastHash = hash;
+    g.queued = true;
+    log(g.tag, "sequencer", hash);
+    fanoutBackups(g, raw);
+    return hash;
+  } catch (err) {
+    const msg = err.shortMessage || err.message || String(err);
+    if (isQueued(msg)) {
+      g.queued = true;
+      log(g.tag, "sequencer already queued");
+      fanoutBackups(g, raw);
+      return g.lastHash;
     }
+    log(g.tag, "sequencer error", msg);
+    const results = await Promise.allSettled(
+      backupUrls.map((url) => sendRaw(url, raw, backupAgent).then((hash) => ({ url, hash }))),
+    );
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        g.lastHash = r.value.hash;
+        g.queued = true;
+        g.backupSent = true;
+        log(g.tag, rpcLabel(r.value.url), r.value.hash);
+        return r.value.hash;
+      }
+      const m = r.reason?.shortMessage || r.reason?.message || String(r.reason);
+      if (isQueued(m)) {
+        g.queued = true;
+        g.backupSent = true;
+        log(g.tag, "backup already queued");
+      } else log(g.tag, "backup rpc error", m);
+    }
+    return g.lastHash;
   }
-  return hash;
 }
 
 async function signAtNonce(g, nonce) {
@@ -251,6 +338,8 @@ async function signAtNonce(g, nonce) {
 }
 
 async function signGunner(g) {
+  g.queued = false;
+  g.backupSent = false;
   g.nonce = await primary.getTransactionCount(g.address, "pending");
   g.signedRaw = await signAtNonce(g, g.nonce);
   g.signedNext = await signAtNonce(g, g.nonce + 1);
@@ -267,8 +356,26 @@ async function signGunner(g) {
   );
 }
 
+async function promoteBackup(g, why) {
+  log(g.tag, why);
+  g.queued = false;
+  g.backupSent = false;
+  g.watching = false;
+  g.inFlight = false;
+  if (g.signedNext) {
+    g.signedRaw = g.signedNext;
+    g.nonce += 1;
+    g.signedNext = await signAtNonce(g, g.nonce + 1);
+  } else {
+    await signGunner(g);
+  }
+  void blast(g, "backup-nonce");
+}
+
 async function watchReceipt(g, hash) {
+  if (!hash || g.success) return;
   const rec = await primary.waitForTransaction(hash, 1, 8_000);
+  if (g.success || soldOut) return;
   if (rec?.status === 1) {
     g.success = true;
     const stats = await nft.getMintStats(g.address);
@@ -276,14 +383,7 @@ async function watchReceipt(g, hash) {
     return;
   }
   if (rec?.status === 0) {
-    log(g.tag, "reverted — firing backup nonce immediately");
-    if (g.signedNext) {
-      g.signedRaw = g.signedNext;
-      g.nonce += 1;
-      g.signedNext = await signAtNonce(g, g.nonce + 1);
-    } else {
-      await signGunner(g);
-    }
+    await promoteBackup(g, "reverted — firing backup nonce immediately");
     return;
   }
   const stats = await nft.getMintStats(g.address);
@@ -293,32 +393,32 @@ async function watchReceipt(g, hash) {
     return;
   }
   const late = await primary.waitForTransaction(hash, 1, 12_000);
+  if (g.success || soldOut) return;
   if (late?.status === 1) {
     g.success = true;
     log(g.tag, "MINTED block", late.blockNumber);
     return;
   }
   if (late?.status === 0) {
-    log(g.tag, "reverted — firing backup nonce immediately");
-    if (g.signedNext) {
-      g.signedRaw = g.signedNext;
-      g.nonce += 1;
-      g.signedNext = await signAtNonce(g, g.nonce + 1);
-    } else {
-      await signGunner(g);
-    }
+    await promoteBackup(g, "reverted — firing backup nonce immediately");
   }
 }
 
 async function blast(g, reason) {
-  if (g.success || g.inFlight || !g.signedRaw || soldOut) return;
+  if (g.success || g.inFlight || g.queued || !g.signedRaw || soldOut) return;
   g.inFlight = true;
   try {
-    log("FIRE", g.tag, reason);
+    if (!g.lastFireLog || Date.now() - g.lastFireLog > 250) {
+      log("FIRE", g.tag, reason);
+      g.lastFireLog = Date.now();
+    }
     const hash = await broadcast(g);
-    if (!hash) return;
-    log(g.tag, "submitted", `https://robin.etherscan.io/tx/${hash}`);
-    await watchReceipt(g, hash);
+    if (hash && !g.watching) {
+      g.watching = true;
+      void watchReceipt(g, hash).finally(() => {
+        g.watching = false;
+      });
+    }
   } catch (err) {
     log(g.tag, "fire error", err.shortMessage || err.message);
     try {
@@ -333,8 +433,20 @@ async function blast(g, reason) {
 
 function fireWave(reason) {
   for (const g of gunners) {
-    if (g.success || g.inFlight || !g.signedRaw) continue;
+    if (g.success || g.inFlight || g.queued || !g.signedRaw || soldOut) continue;
     void blast(g, reason);
+  }
+}
+
+async function checkSoldOut() {
+  try {
+    const minted = await nft.totalMinted();
+    if (minted >= maxSupply) {
+      soldOut = true;
+      log("sold out");
+    }
+  } catch (err) {
+    log("supply check", err.shortMessage || err.message);
   }
 }
 
@@ -359,7 +471,7 @@ async function simulate(dropStartMs) {
 
 async function preflight() {
   log("read RPC", urls.join(" | "));
-  log("broadcast", sendUrls.join(" | "));
+  log("broadcast", sequencerUrl, "first, then", backupUrls.join(" | "));
   await Promise.all(providers.map(({ p }) => p.send("eth_blockNumber", [])));
   await Promise.all([syncClock(), warmSenders()]);
 
@@ -395,6 +507,7 @@ async function preflight() {
   console.log("max / wallet   ", maxPerWallet.toString(), "(lifetime)");
   console.log("latest block   ", block.number, cdt(block.timestamp), "CDT");
   console.log("time until mint", eta(startMs - nowMs()));
+  console.log("wallets loaded ", keys.length, "/ 7");
 
   for (let i = 0; i < keys.length; i++) {
     const tag = `W${i + 1}`;
@@ -436,10 +549,15 @@ async function preflight() {
       nonce,
       signedRaw: null,
       signedNext: null,
+      lastHash: null,
       maxFee,
       prio,
+      queued: false,
+      backupSent: false,
       success: false,
       inFlight: false,
+      watching: false,
+      lastFireLog: 0,
     });
   }
 
@@ -447,6 +565,7 @@ async function preflight() {
   console.log("");
   console.log("simulation     ", sim.ok ? sim.reason : sim.reason);
   console.log("armed wallets  ", gunners.map((g) => g.tag).join(", ") || "(none)");
+  console.log("fire plan      ", "all wallets at once to Ohio sequencer; W1 is not delayed");
   console.log("================================");
   console.log("");
 
@@ -466,11 +585,11 @@ async function preflight() {
   log(
     "READY:",
     gunners.length,
-    "wallet(s). NotActive until start is expected. Fire order:",
-    gunners.map((g) => g.tag).join(" then "),
+    "wallet(s). Independent sequencer shots, no stagger. NotActive until start is expected. Fire:",
+    gunners.map((g) => g.tag).join(", "),
   );
 
-  for (const g of gunners) await signGunner(g);
+  await Promise.all(gunners.map((g) => signGunner(g)));
 
   if (env("ALCHEMY_API_KEY")) {
     ws = new WebSocketProvider(alchemyWs(env("ALCHEMY_API_KEY")), 4663);
@@ -495,42 +614,45 @@ async function preflight() {
 async function waitLoop() {
   let lastResign = 0;
   let lastLog = 0;
+  let lastSupply = 0;
+  let lastWarm = 0;
   let opened = false;
   while (!allMinted() && !soldOut && nowMs() < endMs + 12_000) {
     const until = startMs - nowMs();
 
-    if (until <= 80) {
-      if (!opened) {
-        while (nowMs() < startMs - 2) {
-          /* last milliseconds: no extra RPC */
+    if (until <= 15_000) live = true;
+
+    if (until <= GO_WINDOW_MS) {
+      if (until > 1) {
+        const spinUntil = startMs - 1;
+        while (nowMs() < spinUntil) {
+          if (spinUntil - nowMs() > 8) await sleep(4);
         }
-        opened = true;
-        fireWave("clock-spin");
       }
-      await sleep(60);
-      try {
-        const minted = await nft.totalMinted();
-        if (minted >= maxSupply) {
-          soldOut = true;
-          log("sold out");
-          return;
-        }
-      } catch (err) {
-        log("supply check", err.shortMessage || err.message);
+      fireWave(opened ? "retry" : "go");
+      opened = true;
+      if (Date.now() - lastSupply > 200) {
+        lastSupply = Date.now();
+        void checkSoldOut();
       }
-      fireWave("retry");
+      await sleep(LIVE_RETRY_MS);
       continue;
     }
 
-    const wait = Math.min(intervalFor(until), Math.max(1, until - 80));
+    const wait = Math.min(intervalFor(until), Math.max(1, until - GO_WINDOW_MS));
 
-    if (until <= 12_000 && Date.now() - lastResign > 2_000) {
+    if (until <= 15_000 && Date.now() - lastWarm > 80) {
+      lastWarm = Date.now();
+      void warmSequencer();
+    }
+
+    if (until <= 12_000 && until > GO_WINDOW_MS && Date.now() - lastResign > 2_000) {
       try {
         const drop = await seaDrop.getPublicDrop(NFT);
         startMs = Number(drop.startTime) * 1000;
         endMs = Number(drop.endTime) * 1000;
         mintPrice = drop.mintPrice;
-        for (const g of pendingGunners()) await signGunner(g);
+        await Promise.all(pendingGunners().map((g) => signGunner(g)));
         lastResign = Date.now();
       } catch (err) {
         log("resign error", err.shortMessage || err.message);
@@ -559,7 +681,7 @@ async function waitLoop() {
         }
         await Promise.all([syncClock(), warmSenders()]);
         if (Date.now() - lastResign > 50_000) {
-          for (const g of pendingGunners()) await signGunner(g);
+          await Promise.all(pendingGunners().map((g) => signGunner(g)));
           lastResign = Date.now();
         }
       } catch (err) {
@@ -577,12 +699,14 @@ async function waitLoop() {
 bindRenderPort();
 await preflight();
 log(
-  "waiting — 60s until T-2m, then 1s, then 50ms, then W1→W2→W3 at chain startTime (warm sequencer + backup nonce)",
+  "waiting — 60s until T-2m, then 1s, then 40ms, then 8ms Ohio retry. All wallets fire together at startTime (sequencer-first, same-nonce rebroadcast, backup nonce only after revert).",
 );
 await waitLoop();
 
 if (ws) await ws.destroy();
 for (const { p } of providers) p.destroy();
+void sequencerAgent.close();
+void backupAgent.close();
 
 for (const g of gunners) {
   log(g.tag, g.success ? "OK minted" : "did not mint");

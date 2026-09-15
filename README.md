@@ -54,7 +54,7 @@ setx RF_GENESIS_KEY "0xYOUR_HOT_WALLET_PRIVATE_KEY"
 
 | Secret | Required? | Why |
 | --- | --- | --- |
-| `RF_GENESIS_KEY` | Yes — this is the only required secret | Account private key (hex). Not the mnemonic. |
+| `RF_GENESIS_KEY` … `RF_GENESIS_KEY7` | At least KEY; 2–7 optional | Account private keys (hex). Not the mnemonic. |
 | `ALCHEMY_API_KEY` | Optional, faster | Low-latency HTTP + WebSocket. [dashboard.alchemy.com](https://dashboard.alchemy.com) |
 
 You do **not** need an Etherscan key, OpenSea key, or `.env` file. RPC and sequencer URLs are built in.
@@ -88,9 +88,9 @@ Speed tactics used here:
 
 - One Windows secret only (`RF_GENESIS_KEY`). RPC + sequencer URLs are built in.
 - Preflight proves gas, nonce, remaining supply, lifetime mint cap, and fee recipient before waiting.
-- Minute checks until T-2 minutes, 1s until T-15s, 50ms until T-2s, then a busy-wait so the send hits at ~T-8ms.
-- Pre-sign `mintPublic` (nonce + type-2 fees). Go-live is only `eth_sendRawTransaction` — no gas estimate, no OpenSea HTTP.
-- Keep RPC connections warm and broadcast the same raw tx to public RPC **and** `https://sequencer.mainnet.chain.robinhood.com` in parallel.
+- Minute checks until T-2 minutes, 1s until T-15s, 40ms then 8ms, then a busy-wait so Ohio sequencer send hits at ~T-1ms.
+- Pre-sign `mintPublic` (nonce + type-2 fees). Go-live is sequencer-first `eth_sendRawTransaction`; Alchemy/public RPC fan out without blocking W1–W7.
+- All funded wallets fire at the same instant (no stagger). Same-nonce rebroadcast every ~8ms; backup nonce only after an on-chain revert.
 - Optional Alchemy websocket for `newHeads` if `ALCHEMY_API_KEY` is set.
 - If the first tx reverts (included a hair too early), resign the next nonce and retry while supply remains.
 
@@ -106,7 +106,7 @@ npm run ping
 
 `npm start` / Render / Railway now run the **sniper**, not the ping.
 
-On Render (Ohio): Environment → paste hex private keys as `RF_GENESIS_KEY`, `RF_GENESIS_KEY2`, `RF_GENESIS_KEY3`. Do **not** click Generate. Optional: `ALCHEMY_API_KEY`. Then Save, rebuild, and deploy. Logs should show `READY`. Ping remains `npm run ping`.
+On Render (Ohio): Environment → paste hex private keys as `RF_GENESIS_KEY` … `RF_GENESIS_KEY7`. Do **not** click Generate. Optional: `ALCHEMY_API_KEY`. Then Save, rebuild, and deploy. Logs should show `READY` and all seven wallets. Ping remains `npm run ping`.
 
 ## After public: did anyone mint?
 
