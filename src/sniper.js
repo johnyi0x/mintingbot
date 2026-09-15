@@ -36,9 +36,19 @@ const KEY_NAMES = [
 const DRY_RUN = (process.env.RF_GENESIS_DRY_RUN || "").trim() === "1";
 const LIVE_RETRY_MS = 8;
 const GO_WINDOW_MS = 250;
+const FIRE_LEAD_MS = 4;
 const ARM_MS = 60 * 60 * 1000;
 const HOT_MS = 120_000;
 const IDLE_CHECK_MS = 60_000;
+const FETCH_MS = 2_500;
+const SEQ_FETCH_MS = 1_500;
+/** During GO: short abort so a hung RPC frees the slot and the next wave can shoot. */
+const GO_SEQ_MS = 450;
+const GO_BACKUP_MS = 700;
+const MAX_INFLIGHT_SEQ = 2;
+const MAX_INFLIGHT_BACKUP = 1;
+const HOT_ARM_MS = 8_000;
+
 const mintIface = new Interface(SEADROP_ABI);
 const mintData = mintIface.encodeFunctionData("mintPublic", [
   NFT,
@@ -57,8 +67,12 @@ function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(" ")}`;
   console.log(line);
   if (live) return;
-  mkdirSync("logs", { recursive: true });
-  appendFileSync("logs/sniper.log", line + "\n");
+  try {
+    mkdirSync("logs", { recursive: true });
+    appendFileSync("logs/sniper.log", line + "\n");
+  } catch {
+    /* never die on log IO */
+  }
 }
 
 function fail(msg) {
@@ -110,6 +124,14 @@ function eta(ms) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function withTimeout(promise, ms, label) {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label} timeout ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
 }
 
 function intervalFor(msUntil) {
@@ -177,6 +199,9 @@ let maxPerWallet = 1n;
 let mintPrice = 0n;
 let soldOut = false;
 let clockOffsetMs = 0;
+/** Once true: never resign / never await RPC on the fire path. Fire engine owns minting. */
+let goMode = false;
+let fireTimer = null;
 const gunners = [];
 const chainIdBody = JSON.stringify({
   jsonrpc: "2.0",
@@ -186,7 +211,6 @@ const chainIdBody = JSON.stringify({
 });
 
 function nowMs() {
-  // Negative offset = last block is behind wall clock. Using it would fire early and revert.
   return Date.now() + Math.max(0, clockOffsetMs);
 }
 
@@ -198,18 +222,19 @@ function pendingGunners() {
   return gunners.filter((g) => !g.success);
 }
 
-async function postRpc(url, body) {
+async function postRpc(url, body, timeoutMs = FETCH_MS) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
+    signal: AbortSignal.timeout(timeoutMs),
   });
   return res.json();
 }
 
 async function syncClock() {
   const t0 = Date.now();
-  const block = await primary.getBlock("latest");
+  const block = await withTimeout(primary.getBlock("latest"), FETCH_MS, "syncClock");
   const t1 = Date.now();
   const chainMs = Number(block.timestamp) * 1000 + (t1 - t0) / 2;
   clockOffsetMs = Math.round(chainMs - t1);
@@ -218,17 +243,17 @@ async function syncClock() {
 
 async function warmSequencer() {
   try {
-    await postRpc(sequencerUrl, chainIdBody);
+    await postRpc(sequencerUrl, chainIdBody, SEQ_FETCH_MS);
   } catch {
     /* keep-alive only */
   }
 }
 
 async function warmSenders() {
-  await Promise.allSettled(sendUrls.map((url) => postRpc(url, chainIdBody)));
+  await Promise.allSettled(sendUrls.map((url) => postRpc(url, chainIdBody, FETCH_MS)));
 }
 
-async function sendRaw(url, raw) {
+async function sendRaw(url, raw, timeoutMs = FETCH_MS) {
   const json = await postRpc(
     url,
     JSON.stringify({
@@ -237,6 +262,7 @@ async function sendRaw(url, raw) {
       method: "eth_sendRawTransaction",
       params: [raw],
     }),
+    timeoutMs,
   );
   if (json.error) {
     const err = new Error(json.error.message || "rpc error");
@@ -250,67 +276,71 @@ function isQueued(msg) {
   return /already known|known transaction|nonce too low/i.test(msg || "");
 }
 
-function fanoutBackups(g, raw) {
-  if (g.backupSent) return;
-  g.backupSent = true;
-  for (const url of backupUrls) {
-    void sendRaw(url, raw).then(
-      (hash) => {
-        if (hash) g.lastHash = hash;
-        log(g.tag, rpcLabel(url), hash);
-      },
-      (err) => {
-        const msg = err.shortMessage || err.message || String(err);
-        if (isQueued(msg)) log(g.tag, rpcLabel(url), "already queued");
-        else log(g.tag, rpcLabel(url), "rpc error", msg);
-      },
-    );
-  }
-}
+/** Fire-and-forget with in-flight caps. Never await. Never pile up hung RPCs (that froze CCA). */
+function shootRaw(g, raw) {
+  const targets = [sequencerUrl, ...backupUrls];
+  for (let i = 0; i < targets.length; i++) {
+    const url = targets[i];
+    const isSeq = i === 0;
+    // Backups every 3rd wave only — sequencer is the hot path; saves CU + sockets.
+    if (!isSeq && (g.waveCount % 3) !== 0) continue;
 
-async function broadcast(g) {
-  const raw = g.signedRaw;
-  try {
-    const hash = await sendRaw(sequencerUrl, raw);
-    g.lastHash = hash;
-    g.queued = true;
-    log(g.tag, "sequencer", hash);
-    fanoutBackups(g, raw);
-    return hash;
-  } catch (err) {
-    const msg = err.shortMessage || err.message || String(err);
-    if (isQueued(msg)) {
-      g.queued = true;
-      log(g.tag, "sequencer already queued");
-      fanoutBackups(g, raw);
-      return g.lastHash;
-    }
-    log(g.tag, "sequencer error", msg);
-    if (/exceeds max supply|MintQuantityExceedsMaxSupply/i.test(msg)) {
-      soldOut = true;
-      log("sold out — stopping sends");
-      return g.lastHash;
-    }
-    const results = await Promise.allSettled(
-      backupUrls.map((url) => sendRaw(url, raw).then((hash) => ({ url, hash }))),
-    );
-    for (const r of results) {
-      if (r.status === "fulfilled") {
-        g.lastHash = r.value.hash;
-        g.queued = true;
-        g.backupSent = true;
-        log(g.tag, rpcLabel(r.value.url), r.value.hash);
-        return r.value.hash;
-      }
-      const m = r.reason?.shortMessage || r.reason?.message || String(r.reason);
-      if (isQueued(m)) {
-        g.queued = true;
-        g.backupSent = true;
-        log(g.tag, "backup already queued");
-      } else log(g.tag, "backup rpc error", m);
-    }
-    return g.lastHash;
+    const inflight = g.inflight.get(url) || 0;
+    const cap = isSeq ? MAX_INFLIGHT_SEQ : MAX_INFLIGHT_BACKUP;
+    if (inflight >= cap) continue;
+
+    g.inflight.set(url, inflight + 1);
+    const timeoutMs = goMode
+      ? isSeq
+        ? GO_SEQ_MS
+        : GO_BACKUP_MS
+      : isSeq
+        ? SEQ_FETCH_MS
+        : FETCH_MS;
+
+    void sendRaw(url, raw, timeoutMs)
+      .then(
+        (hash) => {
+          if (hash) {
+            g.lastHash = hash;
+            g.queued = true;
+            if (!goMode || !g.lastHashLog || Date.now() - g.lastHashLog > 150) {
+              log(g.tag, rpcLabel(url), hash);
+              g.lastHashLog = Date.now();
+            }
+            if (!g.watching) {
+              g.watching = true;
+              void watchReceipt(g, hash).finally(() => {
+                g.watching = false;
+              });
+            }
+          }
+        },
+        (err) => {
+          const msg = err.shortMessage || err.message || String(err);
+          if (isQueued(msg)) {
+            g.queued = true;
+            if (!goMode || !g.lastHashLog || Date.now() - g.lastHashLog > 200) {
+              log(g.tag, rpcLabel(url), "already queued");
+              g.lastHashLog = Date.now();
+            }
+          } else if (/exceeds max supply|MintQuantityExceedsMaxSupply/i.test(msg)) {
+            soldOut = true;
+            log("sold out — stopping sends");
+            stopFireEngine();
+          } else if (!/timeout/i.test(msg)) {
+            if (!goMode || !g.lastErrLog || Date.now() - g.lastErrLog > 300) {
+              log(g.tag, rpcLabel(url), "rpc error", msg);
+              g.lastErrLog = Date.now();
+            }
+          }
+        },
+      )
+      .finally(() => {
+        g.inflight.set(url, Math.max(0, (g.inflight.get(url) || 1) - 1));
+      });
   }
+  g.waveCount = (g.waveCount || 0) + 1;
 }
 
 async function signAtNonce(g, nonce) {
@@ -328,16 +358,18 @@ async function signAtNonce(g, nonce) {
 }
 
 async function refreshFees(g) {
-  const balance = await primary.getBalance(g.address);
+  if (goMode) return;
+  const balance = await withTimeout(primary.getBalance(g.address), FETCH_MS, "balance");
   const { maxFee, prio } = feesFor(balance);
   g.maxFee = maxFee;
   g.prio = prio;
 }
 
 async function signGunner(g) {
+  if (goMode) return;
   g.queued = false;
   g.backupSent = false;
-  g.nonce = await primary.getTransactionCount(g.address, "pending");
+  g.nonce = await withTimeout(primary.getTransactionCount(g.address, "pending"), FETCH_MS, "nonce");
   g.signedRaw = await signAtNonce(g, g.nonce);
   g.signedNext = await signAtNonce(g, g.nonce + 1);
   log(
@@ -360,96 +392,141 @@ async function promoteBackup(g, why) {
   g.backupSent = false;
   g.watching = false;
   g.inFlight = false;
-  if (g.signedNext) {
-    g.signedRaw = g.signedNext;
-    g.nonce += 1;
-    g.signedNext = await signAtNonce(g, g.nonce + 1);
-  } else {
-    await signGunner(g);
+  try {
+    if (g.signedNext) {
+      g.signedRaw = g.signedNext;
+      g.nonce += 1;
+      // Do not await fresh sign during GO — fire engine keeps blasting swapped raw.
+      if (!goMode) {
+        g.signedNext = await signAtNonce(g, g.nonce + 1);
+      } else {
+        void signAtNonce(g, g.nonce + 1)
+          .then((raw) => {
+            if (!g.success) g.signedNext = raw;
+          })
+          .catch(() => {});
+      }
+    } else if (!goMode) {
+      await withTimeout(signGunner(g), FETCH_MS * 3, "promoteBackup sign");
+    }
+  } catch (err) {
+    log(g.tag, "promoteBackup error", err.message || err);
+    return;
   }
-  void blast(g, "backup-nonce");
+  blast(g, "backup-nonce");
 }
 
 async function watchReceipt(g, hash) {
   if (!hash || g.success) return;
-  const rec = await primary.waitForTransaction(hash, 1, 8_000);
-  if (g.success || soldOut) return;
-  if (rec?.status === 1) {
-    g.success = true;
-    const stats = await nft.getMintStats(g.address);
-    log(g.tag, "MINTED block", rec.blockNumber, `supply ${stats.currentTotalSupply}/${stats.maxSupply}`);
-    return;
-  }
-  if (rec?.status === 0) {
-    await promoteBackup(g, "reverted — firing backup nonce immediately");
-    return;
-  }
-  const stats = await nft.getMintStats(g.address);
-  if (stats.minterNumMinted > 0n) {
-    g.success = true;
-    log(g.tag, "MINTED (confirmed via balanceOf path)");
-    return;
-  }
-  const late = await primary.waitForTransaction(hash, 1, 12_000);
-  if (g.success || soldOut) return;
-  if (late?.status === 1) {
-    g.success = true;
-    log(g.tag, "MINTED block", late.blockNumber);
-    return;
-  }
-  if (late?.status === 0) {
-    await promoteBackup(g, "reverted — firing backup nonce immediately");
-  }
-}
-
-async function blast(g, reason) {
-  if (g.success || g.inFlight || g.queued || !g.signedRaw || soldOut) return;
-  g.inFlight = true;
   try {
-    if (!g.lastFireLog || Date.now() - g.lastFireLog > 250) {
-      log("FIRE", g.tag, reason);
-      g.lastFireLog = Date.now();
+    const rec = await withTimeout(primary.waitForTransaction(hash, 1, 8_000), 10_000, "receipt");
+    if (g.success || soldOut) return;
+    if (rec?.status === 1) {
+      g.success = true;
+      try {
+        const stats = await withTimeout(nft.getMintStats(g.address), FETCH_MS, "mintStats");
+        log(g.tag, "MINTED block", rec.blockNumber, `supply ${stats.currentTotalSupply}/${stats.maxSupply}`);
+      } catch {
+        log(g.tag, "MINTED block", rec.blockNumber);
+      }
+      if (allMinted()) stopFireEngine();
+      return;
     }
-    const hash = await broadcast(g);
-    if (hash && !g.watching) {
-      g.watching = true;
-      void watchReceipt(g, hash).finally(() => {
-        g.watching = false;
-      });
+    if (rec?.status === 0) {
+      void promoteBackup(g, "reverted — firing backup nonce immediately");
+      return;
     }
   } catch (err) {
-    log(g.tag, "fire error", err.shortMessage || err.message);
-    try {
-      await signGunner(g);
-    } catch (e) {
-      log(g.tag, "resign error", e.shortMessage || e.message);
+    if (!goMode) log(g.tag, "receipt wait", err.message || err);
+  }
+
+  try {
+    const stats = await withTimeout(nft.getMintStats(g.address), FETCH_MS, "mintStats2");
+    if (stats.minterNumMinted > 0n) {
+      g.success = true;
+      log(g.tag, "MINTED (confirmed via balance)");
+      if (allMinted()) stopFireEngine();
+      return;
     }
-  } finally {
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    const late = await withTimeout(primary.waitForTransaction(hash, 1, 12_000), 14_000, "receipt2");
+    if (g.success || soldOut) return;
+    if (late?.status === 1) {
+      g.success = true;
+      log(g.tag, "MINTED block", late.blockNumber);
+      if (allMinted()) stopFireEngine();
+      return;
+    }
+    if (late?.status === 0) {
+      void promoteBackup(g, "reverted — firing backup nonce immediately");
+    }
+  } catch (err) {
+    if (!goMode) log(g.tag, "late receipt", err.message || err);
+    g.queued = false;
     g.inFlight = false;
   }
 }
 
+function blast(g, reason) {
+  if (g.success || !g.signedRaw || soldOut) return;
+  if (!g.lastFireLog || Date.now() - g.lastFireLog > 200) {
+    log("FIRE", g.tag, reason);
+    g.lastFireLog = Date.now();
+  }
+  shootRaw(g, g.signedRaw);
+}
+
 function fireWave(reason) {
   for (const g of gunners) {
-    if (g.success || g.inFlight || g.queued || !g.signedRaw || soldOut) continue;
-    void blast(g, reason);
+    if (g.success || !g.signedRaw || soldOut) continue;
+    blast(g, reason);
+  }
+}
+
+/** Independent mint engine: setInterval only. Never awaits RPC. CCA waited on receipt — we never do. */
+function startFireEngine(reason) {
+  if (soldOut || allMinted()) return;
+  if (fireTimer) return;
+  goMode = true;
+  live = true;
+  log("FIRE ENGINE ON —", reason, "— shoot every", String(LIVE_RETRY_MS) + "ms, no await, inflight-capped");
+  fireWave(reason);
+  fireTimer = setInterval(() => {
+    if (soldOut || allMinted() || nowMs() > endMs + 12_000) {
+      stopFireEngine();
+      return;
+    }
+    fireWave("retry");
+  }, LIVE_RETRY_MS);
+}
+
+function stopFireEngine() {
+  if (fireTimer) {
+    clearInterval(fireTimer);
+    fireTimer = null;
   }
 }
 
 async function checkSoldOut() {
   if (soldOut) return;
   try {
-    const minted = await nft.totalMinted();
+    const minted = await withTimeout(nft.totalMinted(), FETCH_MS, "totalMinted");
     if (minted >= maxSupply) {
       soldOut = true;
+      stopFireEngine();
       log("sold out");
     }
   } catch (err) {
-    log("supply check", err.shortMessage || err.message);
+    if (!goMode) log("supply check", err.shortMessage || err.message);
   }
 }
 
 async function parkForever(why) {
+  stopFireEngine();
   log(why);
   log("PARK — no more sends, no more RPC. leftover ETH stays in the wallets. health server stays up so Render does not restart.");
   if (ws) {
@@ -496,8 +573,8 @@ async function simulate(dropStartMs) {
 
 async function preflight() {
   log("read RPC", urls.join(" | "));
-  log("broadcast", sequencerUrl, "first, then", backupUrls.join(" | "));
-  await Promise.all(providers.map(({ p }) => p.send("eth_blockNumber", [])));
+  log("broadcast", sequencerUrl, "first + backups parallel; all fetches time out");
+  await Promise.all(providers.map(({ p }) => withTimeout(p.send("eth_blockNumber", []), FETCH_MS, "warmup")));
   await Promise.all([syncClock(), warmSenders()]);
 
   const [drop, block, fees, chainId, totalMinted] = await Promise.all([
@@ -583,6 +660,10 @@ async function preflight() {
       inFlight: false,
       watching: false,
       lastFireLog: 0,
+      lastHashLog: 0,
+      lastErrLog: 0,
+      waveCount: 0,
+      inflight: new Map(),
     });
   }
 
@@ -590,7 +671,7 @@ async function preflight() {
   console.log("");
   console.log("simulation     ", sim.ok ? sim.reason : sim.reason);
   console.log("armed wallets  ", gunners.map((g) => g.tag).join(", ") || "(none)");
-  console.log("fire plan      ", "all wallets at once to Ohio sequencer; W1 is not delayed");
+  console.log("fire plan      ", "independent fire engine @8ms; never await send/receipt; inflight-capped; idle until T-1h");
   console.log("================================");
   console.log("");
 
@@ -625,14 +706,9 @@ async function preflight() {
 async function armAlchemyWs() {
   if (ws || !env("ALCHEMY_API_KEY")) return;
   ws = new WebSocketProvider(alchemyWs(env("ALCHEMY_API_KEY")), 4663);
-  ws.on("block", async (n) => {
+  ws.on("block", (n) => {
     if (allMinted() || soldOut) return;
-    try {
-      const b = await ws.getBlock(n);
-      if (b && b.timestamp >= Math.floor(startMs / 1000)) fireWave(`ws-block-${n}`);
-    } catch (err) {
-      log("ws error", err.message);
-    }
+    if (nowMs() >= startMs) startFireEngine(`ws-head-${n}`);
   });
   log("Alchemy websocket armed");
 }
@@ -652,8 +728,8 @@ async function idleUntilArm() {
     await sleep(sleepFor);
     try {
       const [drop, minted] = await Promise.all([
-        watchSeaDrop.getPublicDrop(NFT),
-        watchNft.totalMinted(),
+        withTimeout(watchSeaDrop.getPublicDrop(NFT), FETCH_MS, "idle drop"),
+        withTimeout(watchNft.totalMinted(), FETCH_MS, "idle minted"),
       ]);
       startMs = Number(drop.startTime) * 1000;
       endMs = Number(drop.endTime) * 1000;
@@ -663,9 +739,7 @@ async function idleUntilArm() {
         log("sold out during idle");
         return;
       }
-      if (nowMs() > endMs) {
-        fail("public window already ended");
-      }
+      if (nowMs() > endMs) fail("public window already ended");
       log(
         `IDLE check start ${cdt(drop.startTime)} CDT  left ${maxSupply - minted}/${maxSupply}  T-${eta(startMs - nowMs())}`,
       );
@@ -685,51 +759,80 @@ async function armReady() {
   );
 }
 
+async function hotArm() {
+  if (goMode) return;
+  log("HOT T-2m — Alchemy WS + sequencer keep-alive + resign (time-boxed)");
+  try {
+    await withTimeout(armAlchemyWs(), 3_000, "alchemy ws");
+  } catch (err) {
+    log("alchemy arm skip", err.message || err);
+  }
+  if (goMode) return;
+  try {
+    await withTimeout(
+      Promise.all([
+        syncClock().catch((e) => log("clock skip", e.message)),
+        warmSenders(),
+        ...pendingGunners().map(async (g) => {
+          if (goMode) return;
+          await refreshFees(g);
+          await signGunner(g);
+        }),
+      ]),
+      HOT_ARM_MS,
+      "hot resign",
+    );
+  } catch (err) {
+    log("hot arm partial/skip — will still fire with existing pre-signs", err.message || err);
+  }
+}
+
 async function waitLoop() {
   let lastResign = 0;
   let lastLog = 0;
   let lastSupply = 0;
   let lastWarm = 0;
-  let opened = false;
   let hotArmed = false;
+  let goLogged = false;
+  let goScheduled = false;
+
   while (!allMinted() && !soldOut && nowMs() < endMs + 12_000) {
     const until = startMs - nowMs();
 
+    // Never block the loop on hot arm — kick it off once, continue.
     if (until <= HOT_MS && !hotArmed) {
       hotArmed = true;
-      log("HOT T-2m — Alchemy WS + sequencer keep-alive + resign");
-      await armAlchemyWs();
-      try {
-        await Promise.all([
-          syncClock(),
-          warmSenders(),
-          ...pendingGunners().map(async (g) => {
-            await refreshFees(g);
-            await signGunner(g);
-          }),
-        ]);
-        lastResign = Date.now();
-      } catch (err) {
-        log("hot arm error", err.shortMessage || err.message);
-      }
+      void hotArm();
     }
 
     if (until <= 15_000) live = true;
 
+    // === MINT PATH: schedule / run fire engine. No busy-spin. No await on send/receipt. ===
     if (until <= GO_WINDOW_MS) {
-      if (until > 1) {
-        const spinUntil = startMs - 1;
-        while (nowMs() < spinUntil) {
-          if (spinUntil - nowMs() > 8) await sleep(4);
-        }
+      if (!goLogged) {
+        log("GO WINDOW — schedule fire engine (sleep yields; no CPU spin; no RPC await)");
+        goLogged = true;
       }
-      fireWave(opened ? "retry" : "go");
-      opened = true;
-      if (Date.now() - lastSupply > 200) {
+
+      if (!goScheduled) {
+        goScheduled = true;
+        const delay = Math.max(0, startMs - FIRE_LEAD_MS - nowMs());
+        if (delay > 0 && delay < GO_WINDOW_MS + 100) {
+          // Yields event loop (unlike busy-spin). Exact wake near T-4ms.
+          setTimeout(() => startFireEngine("go"), delay);
+        } else {
+          startFireEngine(until > 0 ? "go" : "late-go");
+        }
+      } else if (!fireTimer && !soldOut && !allMinted()) {
+        // Watchdog: if schedule missed or timer died, force engine on.
+        startFireEngine("watchdog");
+      }
+
+      if (Date.now() - lastSupply > 500) {
         lastSupply = Date.now();
         void checkSoldOut();
       }
-      await sleep(LIVE_RETRY_MS);
+      await sleep(40);
       continue;
     }
 
@@ -740,17 +843,20 @@ async function waitLoop() {
       void warmSequencer();
     }
 
-    if (until <= 12_000 && until > GO_WINDOW_MS && Date.now() - lastResign > 2_000) {
-      try {
-        const drop = await seaDrop.getPublicDrop(NFT);
-        startMs = Number(drop.startTime) * 1000;
-        endMs = Number(drop.endTime) * 1000;
-        mintPrice = drop.mintPrice;
-        await Promise.all(pendingGunners().map((g) => signGunner(g)));
-        lastResign = Date.now();
-      } catch (err) {
-        log("resign error", err.shortMessage || err.message);
-      }
+    // Last 12s: do NOT await multi-wallet resign (CCA froze waiting on RPC before fire).
+    if (!goMode && until <= 12_000 && until > GO_WINDOW_MS && Date.now() - lastResign > 3_000) {
+      lastResign = Date.now();
+      void (async () => {
+        try {
+          const drop = await withTimeout(seaDrop.getPublicDrop(NFT), FETCH_MS, "go drop");
+          if (goMode) return;
+          startMs = Number(drop.startTime) * 1000;
+          endMs = Number(drop.endTime) * 1000;
+          mintPrice = drop.mintPrice;
+        } catch (err) {
+          log("resign/drop skip", err.message || err);
+        }
+      })();
     }
 
     if (wait >= 1_000) {
@@ -759,11 +865,19 @@ async function waitLoop() {
         const readerNft = hot ? nft : watchNft;
         const readerDrop = hot ? seaDrop : watchSeaDrop;
         const readerBlock = hot ? primary : publicProvider;
-        const [minted, drop, block] = await Promise.all([
-          readerNft.totalMinted(),
-          readerDrop.getPublicDrop(NFT),
-          readerBlock.getBlock("latest"),
-        ]);
+        const [minted, drop, block] = await withTimeout(
+          Promise.all([
+            readerNft.totalMinted(),
+            readerDrop.getPublicDrop(NFT),
+            readerBlock.getBlock("latest"),
+          ]),
+          FETCH_MS * 2,
+          "watch tick",
+        );
+        if (goMode) {
+          await sleep(wait);
+          continue;
+        }
         startMs = Number(drop.startTime) * 1000;
         endMs = Number(drop.endTime) * 1000;
         mintPrice = drop.mintPrice;
@@ -778,11 +892,8 @@ async function waitLoop() {
           return;
         }
         if (hot) {
-          await Promise.all([syncClock(), warmSenders()]);
-          if (Date.now() - lastResign > 50_000) {
-            await Promise.all(pendingGunners().map((g) => signGunner(g)));
-            lastResign = Date.now();
-          }
+          void syncClock().catch(() => {});
+          void warmSenders();
         }
       } catch (err) {
         log("watch error", err.shortMessage || err.message);
@@ -794,6 +905,7 @@ async function waitLoop() {
 
     await sleep(wait);
   }
+  stopFireEngine();
 }
 
 bindRenderPort();
@@ -802,11 +914,19 @@ await idleUntilArm();
 if (soldOut) {
   await parkForever("sold out before public");
 }
-await armReady();
+try {
+  await withTimeout(armReady(), 30_000, "armReady");
+} catch (err) {
+  log("armReady error — continuing with whatever is signed", err.message || err);
+}
 log(
-  "watching — idle until T-1h, public RPC until T-2m, then 1s / 40ms / 8ms Ohio fire. All wallets together at on-chain startTime.",
+  "watching — idle→T-1h→T-2m hot(non-blocking)→GO fire-engine(8ms, no await, inflight-capped). CCA-style receipt waits removed from fire path.",
 );
-await waitLoop();
+try {
+  await waitLoop();
+} catch (err) {
+  log("waitLoop crash", err.message || err);
+}
 
 for (const g of gunners) {
   log(g.tag, g.success ? "OK minted" : "did not mint");
