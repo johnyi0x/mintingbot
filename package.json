@@ -1,0 +1,18 @@
+{
+  "name": "rare-friends-mint-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fast SeaDrop mint sniper for Rare Friends Genesis on Robinhood Chain",
+  "scripts": {
+    "start": "node src/pingSequencer.js",
+    "ping": "node src/pingSequencer.js",
+    "sniper": "node src/sniper.js",
+    "status": "node src/status.js",
+    "watch": "node src/watchPublicMints.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "ethers": "^6.15.0"
+  }
+}
