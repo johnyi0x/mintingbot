@@ -36,6 +36,9 @@ const KEY_NAMES = [
 const DRY_RUN = (process.env.RF_GENESIS_DRY_RUN || "").trim() === "1";
 const LIVE_RETRY_MS = 8;
 const GO_WINDOW_MS = 250;
+const ARM_MS = 60 * 60 * 1000;
+const HOT_MS = 120_000;
+const IDLE_CHECK_MS = 10 * 60 * 1000;
 const mintIface = new Interface(SEADROP_ABI);
 const mintData = mintIface.encodeFunctionData("mintPublic", [
   NFT,
@@ -110,6 +113,7 @@ function sleep(ms) {
 }
 
 function intervalFor(msUntil) {
+  if (msUntil > 15 * 60_000) return 5 * 60_000;
   if (msUntil > 120_000) return 60_000;
   if (msUntil > 15_000) return 1_000;
   if (msUntil > 2_000) return 40;
@@ -163,8 +167,11 @@ const providers = urls.map((url) => ({
   p: new JsonRpcProvider(url, 4663, { staticNetwork: true }),
 }));
 const primary = providers[0].p;
+const publicProvider = new JsonRpcProvider(PUBLIC_RPC, 4663, { staticNetwork: true });
 const nft = new Contract(NFT, NFT_ABI, primary);
 const seaDrop = new Contract(SEADROP, SEADROP_ABI, primary);
+const watchNft = new Contract(NFT, NFT_ABI, publicProvider);
+const watchSeaDrop = new Contract(SEADROP, SEADROP_ABI, publicProvider);
 
 let ws = null;
 let startMs = 0;
@@ -565,32 +572,76 @@ async function preflight() {
   }
 
   log(
-    "READY:",
+    "PREFLIGHT OK:",
     gunners.length,
-    "wallet(s). Independent sequencer shots, no stagger. NotActive until start is expected. Fire:",
+    "wallet(s). Public start",
+    cdt(drop.startTime),
+    "CDT. Fire:",
     gunners.map((g) => g.tag).join(", "),
   );
-
-  await Promise.all(gunners.map((g) => signGunner(g)));
-
-  if (env("ALCHEMY_API_KEY")) {
-    ws = new WebSocketProvider(alchemyWs(env("ALCHEMY_API_KEY")), 4663);
-    ws.on("block", async (n) => {
-      if (allMinted() || soldOut) return;
-      try {
-        const b = await ws.getBlock(n);
-        if (b && b.timestamp >= Math.floor(startMs / 1000)) fireWave(`ws-block-${n}`);
-      } catch (err) {
-        log("ws error", err.message);
-      }
-    });
-    log("Alchemy websocket armed");
-  }
 
   if (DRY_RUN) {
     log("RF_GENESIS_DRY_RUN=1 — preflight only");
     process.exit(0);
   }
+}
+
+async function armAlchemyWs() {
+  if (ws || !env("ALCHEMY_API_KEY")) return;
+  ws = new WebSocketProvider(alchemyWs(env("ALCHEMY_API_KEY")), 4663);
+  ws.on("block", async (n) => {
+    if (allMinted() || soldOut) return;
+    try {
+      const b = await ws.getBlock(n);
+      if (b && b.timestamp >= Math.floor(startMs / 1000)) fireWave(`ws-block-${n}`);
+    } catch (err) {
+      log("ws error", err.message);
+    }
+  });
+  log("Alchemy websocket armed");
+}
+
+async function idleUntilArm() {
+  if (startMs - nowMs() <= ARM_MS) return;
+  log(
+    "IDLE — no Alchemy WS, no sequencer warm, no resign. Public RPC check every 10m until T-1h. Mint",
+    cdt(Math.floor(startMs / 1000)),
+    "CDT",
+  );
+  while (!soldOut && nowMs() < endMs) {
+    const until = startMs - nowMs();
+    if (until <= ARM_MS) break;
+    const sleepFor = Math.max(5_000, Math.min(until - ARM_MS, IDLE_CHECK_MS));
+    log(`IDLE T-${eta(until)} — sleep ${eta(sleepFor)}`);
+    await sleep(sleepFor);
+    try {
+      const [drop, minted] = await Promise.all([
+        watchSeaDrop.getPublicDrop(NFT),
+        watchNft.totalMinted(),
+      ]);
+      startMs = Number(drop.startTime) * 1000;
+      endMs = Number(drop.endTime) * 1000;
+      mintPrice = drop.mintPrice;
+      if (minted >= maxSupply) {
+        soldOut = true;
+        log("sold out during idle");
+        return;
+      }
+      if (nowMs() > endMs) {
+        fail("public window already ended");
+      }
+      log(
+        `IDLE check start ${cdt(drop.startTime)} CDT  left ${maxSupply - minted}/${maxSupply}  T-${eta(startMs - nowMs())}`,
+      );
+    } catch (err) {
+      log("IDLE check", err.shortMessage || err.message);
+    }
+  }
+}
+
+async function armReady() {
+  log("READY T-1h — public RPC watch. Alchemy + sequencer warm start at T-2m.");
+  await Promise.all(gunners.map((g) => signGunner(g)));
 }
 
 async function waitLoop() {
@@ -599,8 +650,25 @@ async function waitLoop() {
   let lastSupply = 0;
   let lastWarm = 0;
   let opened = false;
+  let hotArmed = false;
   while (!allMinted() && !soldOut && nowMs() < endMs + 12_000) {
     const until = startMs - nowMs();
+
+    if (until <= HOT_MS && !hotArmed) {
+      hotArmed = true;
+      log("HOT T-2m — Alchemy WS + sequencer keep-alive + resign");
+      await armAlchemyWs();
+      try {
+        await Promise.all([
+          syncClock(),
+          warmSenders(),
+          ...pendingGunners().map((g) => signGunner(g)),
+        ]);
+        lastResign = Date.now();
+      } catch (err) {
+        log("hot arm error", err.shortMessage || err.message);
+      }
+    }
 
     if (until <= 15_000) live = true;
 
@@ -643,10 +711,14 @@ async function waitLoop() {
 
     if (wait >= 1_000) {
       try {
+        const hot = until <= HOT_MS;
+        const readerNft = hot ? nft : watchNft;
+        const readerDrop = hot ? seaDrop : watchSeaDrop;
+        const readerBlock = hot ? primary : publicProvider;
         const [minted, drop, block] = await Promise.all([
-          nft.totalMinted(),
-          seaDrop.getPublicDrop(NFT),
-          primary.getBlock("latest"),
+          readerNft.totalMinted(),
+          readerDrop.getPublicDrop(NFT),
+          readerBlock.getBlock("latest"),
         ]);
         startMs = Number(drop.startTime) * 1000;
         endMs = Number(drop.endTime) * 1000;
@@ -661,10 +733,12 @@ async function waitLoop() {
           log("sold out while waiting");
           return;
         }
-        await Promise.all([syncClock(), warmSenders()]);
-        if (Date.now() - lastResign > 50_000) {
-          await Promise.all(pendingGunners().map((g) => signGunner(g)));
-          lastResign = Date.now();
+        if (hot) {
+          await Promise.all([syncClock(), warmSenders()]);
+          if (Date.now() - lastResign > 50_000) {
+            await Promise.all(pendingGunners().map((g) => signGunner(g)));
+            lastResign = Date.now();
+          }
         }
       } catch (err) {
         log("watch error", err.shortMessage || err.message);
@@ -680,13 +754,20 @@ async function waitLoop() {
 
 bindRenderPort();
 await preflight();
+await idleUntilArm();
+if (soldOut) {
+  log("sold out before public");
+  process.exit(1);
+}
+await armReady();
 log(
-  "waiting — 60s until T-2m, then 1s, then 40ms, then 8ms Ohio retry. All wallets fire together at startTime (sequencer-first, same-nonce rebroadcast, backup nonce only after revert).",
+  "watching — idle until T-1h, public RPC until T-2m, then 1s / 40ms / 8ms Ohio fire. All wallets together at on-chain startTime.",
 );
 await waitLoop();
 
 if (ws) await ws.destroy();
 for (const { p } of providers) p.destroy();
+publicProvider.destroy();
 
 for (const g of gunners) {
   log(g.tag, g.success ? "OK minted" : "did not mint");
