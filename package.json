@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Fast SeaDrop mint sniper for Rare Friends Genesis on Robinhood Chain",
   "scripts": {
-    "start": "node src/pingSequencer.js",
+    "start": "node src/sniper.js",
     "ping": "node src/pingSequencer.js",
     "sniper": "node src/sniper.js",
     "status": "node src/status.js",

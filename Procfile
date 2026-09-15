@@ -1,1 +1,1 @@
-web: node src/pingSequencer.js
+web: node src/sniper.js

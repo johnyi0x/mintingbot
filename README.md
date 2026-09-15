@@ -98,19 +98,15 @@ Speed tactics used here:
 
 A bot cannot invent whitelist eligibility. If you are not on the merkle tree, `mintAllowList` reverts.
 
-## Sequencer ping (home vs Railway)
-
-This is how you find the closest machine to `https://sequencer.mainnet.chain.robinhood.com`.
-
-On this PC (keep the sniper running in the other window):
+## Sequencer ping
 
 ```powershell
-node src/pingSequencer.js
+npm run ping
 ```
 
-On Railway: deploy this repo as-is. `railway.toml` / `Procfile` start **`node src/pingSequencer.js`**, not the sniper. It loops every 30s. Open Deploy Logs and copy the **MIN ms on sequencer**. Try US-East, then US-West, then EU. Lowest MIN wins.
+`npm start` / Render / Railway now run the **sniper**, not the ping.
 
-Do not put `RF_GENESIS_KEY*` on the ping service. Switch start command to `node src/sniper.js` only after you pick a region and you are ready to mint from Railway instead of this PC.
+On Render (Ohio): Environment → paste hex private keys as `RF_GENESIS_KEY`, `RF_GENESIS_KEY2`, `RF_GENESIS_KEY3`. Do **not** click Generate. Optional: `ALCHEMY_API_KEY`. Then Save, rebuild, and deploy. Logs should show `READY`. Ping remains `npm run ping`.
 
 ## After public: did anyone mint?
 

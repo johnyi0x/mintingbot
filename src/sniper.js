@@ -1,4 +1,5 @@
 import { appendFileSync, mkdirSync } from "node:fs";
+import { createServer } from "node:http";
 import {
   Contract,
   Interface,
@@ -47,6 +48,18 @@ function log(...args) {
 function fail(msg) {
   log("NOT READY:", msg);
   process.exit(1);
+}
+
+function bindRenderPort() {
+  const port = Number(process.env.PORT);
+  if (!Number.isFinite(port) || port <= 0) return;
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("sniper running\n");
+  });
+  server.listen(port, "0.0.0.0", () => {
+    log("health server on port", String(port));
+  });
 }
 
 function unique(urls) {
@@ -561,6 +574,7 @@ async function waitLoop() {
   }
 }
 
+bindRenderPort();
 await preflight();
 log(
   "waiting — 60s until T-2m, then 1s, then 50ms, then W1→W2→W3 at chain startTime (warm sequencer + backup nonce)",
